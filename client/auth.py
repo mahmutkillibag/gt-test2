@@ -16,6 +16,7 @@ Stdlib only (urllib + http.cookiejar) to avoid extra deps.
 import json, re, ssl, urllib.request, urllib.parse, http.cookiejar
 import socket
 import time
+from html import unescape
 
 SERVER_DATA_URL = "https://www.growtopia1.com/growtopia/server_data.php"
 LOGIN_HOST = "https://login.growtopiagame.com"
@@ -193,9 +194,19 @@ def _find_csrf(html):
 
 
 def _find_growid_login_href(html):
-    m = re.search(r'href="(/player/growid/login[^"]*)"', html) or \
-        re.search(r'(https?://login\.growtopiagame\.com/player/growid/login[^"\s]*)', html)
-    return m.group(1) if m else ""
+    # Match the login page exactly, never its POST-only /validate subpath.
+    candidates = re.findall(r'''href\s*=\s*["']([^"']+)["']''', html, re.I)
+    candidates += re.findall(r'''https://login\.growtopiagame\.com/[^"'\s<>]+''', html)
+    for candidate in candidates:
+        candidate = unescape(candidate)
+        try:
+            url = urllib.parse.urlsplit(urllib.parse.urljoin(LOGIN_HOST, candidate))
+            if (url.scheme == "https" and url.netloc == "login.growtopiagame.com"
+                    and url.path == "/player/growid/login"):
+                return candidate
+        except ValueError:
+            continue
+    return ""
 
 
 def _dashboard_blob(cfg, meta):
@@ -227,9 +238,11 @@ def _login_page(op, timeout, blob, dbg=None, diagnostics=None):
     if dbg is not None:
         dbg.append(("POST /player/login/dashboard(blob)", status, len(html),
                     bool(_find_csrf(html)), _find_growid_login_href(html)))
+    if status >= 400:
+        raise RuntimeError("Login dashboard unavailable (HTTP %d); credential submission skipped" % status)
     href = _find_growid_login_href(html)                       # growid/login?token=<big token>
     if href:
-        url = href if href.startswith("http") else LOGIN_HOST + href
+        url = urllib.parse.urljoin(LOGIN_HOST, href)
         try:
             html2, status2 = _get(url)
             if dbg is not None:

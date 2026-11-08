@@ -18,7 +18,7 @@ It is not the final 24/7 deployment and does not use the endless reconnect loop.
    failure or after at most 300 seconds total. It uses normal auth/connection
    retries within that session, but no repeated full-session reconnect loop.
 6. Share the `[auth-diag]` lines and final `[live-test] SUMMARY`. This revision
-   reports `revision: auth-diagnostics-v3`. Diagnostics include request stages,
+   reports `revision: auth-fix-v4`. Diagnostics include request stages,
    HTTP statuses, timings, and challenge indicators, without response bodies,
    URLs, passwords, or token values. Keep your existing sealed variable when
    updating from the first live-test package; no configuration change is needed.
@@ -55,3 +55,7 @@ compromised, nor does sealing a variable remove provider-side trust.
 
 Revision v3 stops on an unsuccessful GrowID page instead of reusing dashboard CSRF.
 It also records allow_get/allow_post and fixed-label redirect destinations.
+
+Revision v4 matches the exact HTTPS GrowID login-page path, excluding /validate.
+A login form already returned by the dashboard redirect proceeds to POST validation
+without an erroneous GET of its form action. Real login-page failures still stop.
