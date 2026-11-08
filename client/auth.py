@@ -74,6 +74,18 @@ def _request(op, req, timeout, stage, diagnostics=None, encoding="utf-8"):
             text = body.decode(encoding, "replace")
             lower = text.lower()
             headers = response.headers
+            allowed = {v.strip().upper() for v in headers.get("Allow", "").split(",")}
+            row["allow_get"] = "GET" in allowed
+            row["allow_post"] = "POST" in allowed
+            final_url = response.geturl() if hasattr(response, "geturl") else None
+            if isinstance(final_url, str):
+                row["redirected"] = final_url != req.full_url
+                path = urllib.parse.urlsplit(final_url).path
+                row["final_route"] = {
+                    "/player/login/dashboard": "dashboard",
+                    "/player/growid/login": "growid_page",
+                    "/player/growid/login/validate": "validate",
+                }.get(path, "other")
             content_type = headers.get("Content-Type", "").lower()
             row.update(content_type=("html" if "html" in content_type else
                                      "json" if "json" in content_type else "other"),
@@ -223,8 +235,12 @@ def _login_page(op, timeout, blob, dbg=None, diagnostics=None):
             if dbg is not None:
                 dbg.append(("GET growid/login?token=..", status2, len(html2), bool(_find_csrf(html2)), ""))
                 dbg.append(("  growid-page snippet", "", 0, False, _snippet(html2)))
-            if _find_csrf(html2):
-                html = html2
+            if status2 >= 400 or not _find_csrf(html2):
+                if diagnostics is not None:
+                    diagnostics.append({"stage": "growid_page_result",
+                                        "failure_kind": "login_form_unavailable"})
+                raise RuntimeError("GrowID page unavailable (HTTP %d); credential submission skipped" % status2)
+            html = html2
         except urllib.error.HTTPError as e:
             if dbg is not None:
                 dbg.append(("GET growid/login", e.code, 0, False, ""))
