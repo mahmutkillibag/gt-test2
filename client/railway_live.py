@@ -49,9 +49,10 @@ def run_session(cfg):
     import proxy_transport
     proxy_transport.configure(None)
     netguard.install()
+    cfg["_auth_diagnostics"] = []
     bot = ObservedSentry(cfg)
     started = time.monotonic()
-    report = {"test": "railway_live", "mode": "direct", "limit_seconds": 300,
+    report = {"test": "railway_live", "revision": "auth-diagnostics-v2", "mode": "direct", "limit_seconds": 300,
               "joined_world": False, "in_world_seconds": 0, "limit_reached": False}
     print("[live-test] one session, at most 300 seconds; existing burner identity; direct Railway route", flush=True)
     try:
@@ -71,6 +72,9 @@ def run_session(cfg):
             report["joined_world"] = True
             report["in_world_seconds"] = round(ended - bot.world_entered_at, 1)
         bot._cleanup()
+        report["auth_diagnostics"] = cfg["_auth_diagnostics"]
+        for event in report["auth_diagnostics"]:
+            print("[auth-diag] " + json.dumps(event), flush=True)
     return report
 
 

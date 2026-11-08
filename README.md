@@ -17,7 +17,12 @@ It is not the final 24/7 deployment and does not use the endless reconnect loop.
 5. Deploy the staged code/variable changes. It attempts one session and stops on
    failure or after at most 300 seconds total. It uses normal auth/connection
    retries within that session, but no repeated full-session reconnect loop.
-6. Share the log from `[live-test]` onward, especially the final SUMMARY. Treat
+6. Share the `[auth-diag]` lines and final `[live-test] SUMMARY`. This revision
+   reports `revision: auth-diagnostics-v2`. Diagnostics include request stages,
+   HTTP statuses, timings, and challenge indicators, without response bodies,
+   URLs, passwords, or token values. Keep your existing sealed variable when
+   updating from the first live-test package; no configuration change is needed.
+   Treat
    chat/player names and account/world identifiers in normal sentry logs as
    private as appropriate; redact those before sharing. Never share the variable.
 
