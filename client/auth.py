@@ -73,7 +73,9 @@ def _login_rejection_kind(message):
     """Classify known responses without echoing server-supplied text or secrets."""
     low = str(message).lower()
     for phrase in ("advanced account protection", "update required", "exhausted",
-                   "too many", "maintenance", "incorrect", "invalid password", "mismatched"):
+                   "too many", "maintenance", "incorrect", "invalid password", "mismatched",
+                   "csrf token mismatch", "unauthenticated", "validation failed", "required",
+                   "expired", "access denied"):
         if phrase in low:
             return phrase
     return "unspecified rejection"
@@ -110,6 +112,11 @@ def _request(op, req, timeout, stage, diagnostics=None, encoding="utf-8"):
             if isinstance(final_url, str):
                 row["redirected"] = final_url != req.full_url
                 path = urllib.parse.urlsplit(final_url).path
+                known_segments = {"player", "login", "growid", "dashboard", "validate",
+                                  "error", "failed", "failure", "auth", "session", "expired"}
+                row["final_path_shape"] = "/".join(
+                    part if part in known_segments or not part else "<redacted>"
+                    for part in path.split("/"))
                 row["final_route"] = {
                     "/player/login/dashboard": "dashboard",
                     "/player/growid/login": "growid_page",
@@ -456,6 +463,8 @@ def growid_login(growid, password, blob_factory, timeout=15, attempts=4, diagnos
     data = urllib.parse.urlencode({"_token": csrf, "growId": growid, "password": password}).encode()
     req = urllib.request.Request(LOGIN_HOST + "/player/growid/login/validate", data=data, method="POST",
                                  headers={"User-Agent": BROWSER_UA,
+                                          "Accept": "application/json",
+                                          "X-Requested-With": "XMLHttpRequest",
                                           "Content-Type": "application/x-www-form-urlencoded",
                                           "Origin": LOGIN_HOST, "Referer": LOGIN_HOST + "/player/growid/login"})
     raw, status = _request(op, req, timeout, "validate", diagnostics)
@@ -479,7 +488,9 @@ def growid_login(growid, password, blob_factory, timeout=15, attempts=4, diagnos
         reason = _login_rejection_kind(j.get("message", ""))
         if diagnostics is not None:
             diagnostics.append({"stage": "validate_result", "failure_kind": "login_rejected",
-                                "http_status": status, "reason_category": reason})
+                                "http_status": status, "reason_category": reason,
+                                "error_fields": [field for field in ("growId", "password", "_token", "token", "reg")
+                                                 if isinstance(j.get("errors"), dict) and field in j["errors"]]})
         raise RuntimeError("growid login rejected: %s (HTTP %d)" % (reason, status))
     session = {"token": j.get("token", ""), "accountType": j.get("accountType"), "accountAge": j.get("accountAge")}
     # Surface the response SHAPE (keys only, no secret values) to learn how the token maps to the ENet
