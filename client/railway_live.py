@@ -52,7 +52,7 @@ def run_session(cfg):
     cfg["_auth_diagnostics"] = []
     bot = ObservedSentry(cfg)
     started = time.monotonic()
-    report = {"test": "railway_live", "revision": "auth-fix-v4", "mode": "direct", "limit_seconds": 300,
+    report = {"test": "railway_live", "revision": "auth-html-v5", "mode": "direct", "limit_seconds": 300,
               "joined_world": False, "in_world_seconds": 0, "limit_reached": False}
     print("[live-test] one session, at most 300 seconds; existing burner identity; direct Railway route", flush=True)
     try:

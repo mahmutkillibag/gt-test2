@@ -14,6 +14,37 @@ real client sends - never crafted/probe traffic. Password is read from config an
 Stdlib only (urllib + http.cookiejar) to avoid extra deps.
 """
 import json, re, ssl, urllib.request, urllib.parse, http.cookiejar
+import socket
+import time
+from html import unescape
+from html.parser import HTMLParser
+
+
+def _html_login_rejection(body):
+    """Classify login error elements without exposing their server-supplied text."""
+    class Errors(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.stack, self.parts = [], []
+
+        def handle_starttag(self, tag, attrs):
+            classes = dict(attrs).get("class", "").split()
+            active = (self.stack[-1] if self.stack else False) or "text-danger-wrapper" in classes
+            if tag not in {"input", "br", "hr", "img", "meta", "link", "area", "base", "embed", "param", "source", "track", "wbr"}:
+                self.stack.append(active)
+
+        def handle_endtag(self, tag):
+            if self.stack:
+                self.stack.pop()
+
+        def handle_data(self, data):
+            if self.stack and self.stack[-1]:
+                self.parts.append(data)
+
+    parser = Errors()
+    parser.feed(body)
+    message = " ".join(parser.parts).strip()
+    return _login_rejection_kind(message) if message else None
 
 SERVER_DATA_URL = "https://www.growtopia1.com/growtopia/server_data.php"
 LOGIN_HOST = "https://login.growtopiagame.com"
@@ -21,6 +52,90 @@ LOGIN_HOST = "https://login.growtopiagame.com"
 GAME_UA = "UbiServices_SDK_2022.Release.9_PC64_ansi_static"
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/120.0.0.0 Safari/537.36")
+
+
+def _failure_kind(exc):
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return "certificate_verification"
+    if isinstance(reason, ssl.SSLError):
+        return "tls"
+    if isinstance(reason, socket.gaierror):
+        return "dns"
+    if isinstance(reason, TimeoutError):
+        return "timeout"
+    if isinstance(reason, ConnectionError):
+        return "connection"
+    return "request_error"
+
+
+def _login_rejection_kind(message):
+    """Classify known responses without echoing server-supplied text or secrets."""
+    low = str(message).lower()
+    for phrase in ("advanced account protection", "update required", "exhausted",
+                   "too many", "maintenance", "incorrect", "invalid password", "mismatched"):
+        if phrase in low:
+            return phrase
+    return "unspecified rejection"
+
+
+def _request(op, req, timeout, stage, diagnostics=None, encoding="utf-8"):
+    """Read a response while recording only fixed-label, secret-free metadata.
+
+    Never store URLs, query strings, headers, HTML, JSON values or exception text.
+    HTTP error bodies remain available to the existing login-page parser.
+    """
+    started = time.monotonic()
+    row = {"stage": stage}
+    try:
+        try:
+            response = op.open(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            response = exc
+        with response:
+            status = response.code if isinstance(response, urllib.error.HTTPError) else response.status
+            row["http_status"] = int(status)
+            body = response.read(2 * 1024 * 1024 + 1)
+            row["response_bytes"] = len(body)
+            if len(body) > 2 * 1024 * 1024:
+                row["failure_kind"] = "response_too_large"
+                raise RuntimeError("auth response exceeded size limit")
+            text = body.decode(encoding, "replace")
+            lower = text.lower()
+            headers = response.headers
+            allowed = {v.strip().upper() for v in headers.get("Allow", "").split(",")}
+            row["allow_get"] = "GET" in allowed
+            row["allow_post"] = "POST" in allowed
+            final_url = response.geturl() if hasattr(response, "geturl") else None
+            if isinstance(final_url, str):
+                row["redirected"] = final_url != req.full_url
+                path = urllib.parse.urlsplit(final_url).path
+                row["final_route"] = {
+                    "/player/login/dashboard": "dashboard",
+                    "/player/growid/login": "growid_page",
+                    "/player/growid/login/validate": "validate",
+                }.get(path, "other")
+            content_type = headers.get("Content-Type", "").lower()
+            row.update(content_type=("html" if "html" in content_type else
+                                     "json" if "json" in content_type else "other"),
+                       csrf_present=bool(_find_csrf(text)),
+                       login_link_present=bool(_find_growid_login_href(text)),
+                       cloudflare_server="cloudflare" in headers.get("Server", "").lower(),
+                       challenge_header=headers.get("cf-mitigated", "").lower() == "challenge",
+                       challenge_marker=any(marker in lower for marker in
+                                            ("cf-chl-", "/cdn-cgi/challenge-platform/", "just a moment")))
+            retry = headers.get("Retry-After", "")
+            if re.fullmatch(r"[0-9]{1,6}", retry):
+                row["retry_after_seconds"] = int(retry)
+            return text, status
+    except Exception as exc:
+        row["error_type"] = type(exc).__name__
+        row.setdefault("failure_kind", _failure_kind(exc))
+        raise
+    finally:
+        row["elapsed_seconds"] = round(time.monotonic() - started, 2)
+        if diagnostics is not None:
+            diagnostics.append(row)
 
 
 def _web_headers(extra=None):
@@ -59,11 +174,11 @@ def _parse_kv_bar(text):
     return out
 
 
-def fetch_server_data(protocol="227", version="5.61", platform="0", timeout=15):
+def fetch_server_data(protocol="227", version="5.61", platform="0", timeout=15, diagnostics=None):
     errors = []
     for host in ("www.growtopia1.com", "www.growtopia2.com"):
         try:
-            return _fetch_server_data(host, protocol, version, platform, timeout)
+            return _fetch_server_data(host, protocol, version, platform, timeout, diagnostics)
         except (OSError, RuntimeError) as exc:
             status = getattr(exc, "code", None)
             errors.append("%s: %s%s" % (host, type(exc).__name__,
@@ -71,7 +186,7 @@ def fetch_server_data(protocol="227", version="5.61", platform="0", timeout=15):
     raise RuntimeError("server discovery failed; " + "; ".join(errors))
 
 
-def _fetch_server_data(host, protocol, version, platform, timeout):
+def _fetch_server_data(host, protocol, version, platform, timeout, diagnostics=None):
     """POST server_data.php -> {server, port, type, meta, ...}. `meta` feeds the login's meta field."""
     body = urllib.parse.urlencode({
         "version": version, "platform": platform, "protocol": protocol,
@@ -79,8 +194,10 @@ def _fetch_server_data(host, protocol, version, platform, timeout):
     req = urllib.request.Request("https://%s/growtopia/server_data.php" % host, data=body, method="POST", headers={
         "User-Agent": GAME_UA, "Content-Type": "application/x-www-form-urlencoded",
     })
-    with _opener().open(req, timeout=timeout) as r:
-        text = r.read().decode("latin1", "replace")
+    stage = "server_data_primary" if host == "www.growtopia1.com" else "server_data_alternate"
+    text, status = _request(_opener(), req, timeout, stage, diagnostics, encoding="latin1")
+    if status >= 400:
+        raise RuntimeError("%s returned HTTP %d" % (stage, status))
     data = _parse_kv_bar(text)
     if "server" not in data:
         raise RuntimeError("server_data.php returned no server; got keys %s" % list(data))
@@ -105,9 +222,19 @@ def _find_csrf(html):
 
 
 def _find_growid_login_href(html):
-    m = re.search(r'href="(/player/growid/login[^"]*)"', html) or \
-        re.search(r'(https?://login\.growtopiagame\.com/player/growid/login[^"\s]*)', html)
-    return m.group(1) if m else ""
+    # Match the login page exactly, never its POST-only /validate subpath.
+    candidates = re.findall(r'''href\s*=\s*["']([^"']+)["']''', html, re.I)
+    candidates += re.findall(r'''https://login\.growtopiagame\.com/[^"'\s<>]+''', html)
+    for candidate in candidates:
+        candidate = unescape(candidate)
+        try:
+            url = urllib.parse.urlsplit(urllib.parse.urljoin(LOGIN_HOST, candidate))
+            if (url.scheme == "https" and url.netloc == "login.growtopiagame.com"
+                    and url.path == "/player/growid/login"):
+                return candidate
+        except ValueError:
+            continue
+    return ""
 
 
 def _dashboard_blob(cfg, meta):
@@ -121,17 +248,15 @@ def _dashboard_blob(cfg, meta):
     return L.build_login_text(preauth, requested_name="", session={"meta": meta})
 
 
-def _login_page(op, timeout, blob, dbg=None):
+def _login_page(op, timeout, blob, dbg=None, diagnostics=None):
     """Reach the growid login FORM, return (html, csrf). Chain: POST dashboard(blob) -> GET growid/login."""
     def _get(url):
         req = urllib.request.Request(url, headers=_web_headers())
-        with op.open(req, timeout=timeout) as r:
-            return r.read().decode("utf-8", "replace"), r.status
+        return _request(op, req, timeout, "growid_page", diagnostics)
     def _post(url, body):
         req = urllib.request.Request(url, data=body, method="POST",
                                      headers=_web_headers({"Content-Type": "application/x-www-form-urlencoded"}))
-        with op.open(req, timeout=timeout) as r:
-            return r.read().decode("utf-8", "replace"), r.status
+        return _request(op, req, timeout, "dashboard", diagnostics)
 
     html, status = "", 0
     try:
@@ -141,16 +266,22 @@ def _login_page(op, timeout, blob, dbg=None):
     if dbg is not None:
         dbg.append(("POST /player/login/dashboard(blob)", status, len(html),
                     bool(_find_csrf(html)), _find_growid_login_href(html)))
+    if status >= 400:
+        raise RuntimeError("Login dashboard unavailable (HTTP %d); credential submission skipped" % status)
     href = _find_growid_login_href(html)                       # growid/login?token=<big token>
     if href:
-        url = href if href.startswith("http") else LOGIN_HOST + href
+        url = urllib.parse.urljoin(LOGIN_HOST, href)
         try:
             html2, status2 = _get(url)
             if dbg is not None:
                 dbg.append(("GET growid/login?token=..", status2, len(html2), bool(_find_csrf(html2)), ""))
                 dbg.append(("  growid-page snippet", "", 0, False, _snippet(html2)))
-            if _find_csrf(html2):
-                html = html2
+            if status2 >= 400 or not _find_csrf(html2):
+                if diagnostics is not None:
+                    diagnostics.append({"stage": "growid_page_result",
+                                        "failure_kind": "login_form_unavailable"})
+                raise RuntimeError("GrowID page unavailable (HTTP %d); credential submission skipped" % status2)
+            html = html2
         except urllib.error.HTTPError as e:
             if dbg is not None:
                 dbg.append(("GET growid/login", e.code, 0, False, ""))
@@ -304,7 +435,7 @@ def probe_growid_page(timeout=15):
     return
 
 
-def growid_login(growid, password, blob_factory, timeout=15, attempts=4):
+def growid_login(growid, password, blob_factory, timeout=15, attempts=4, diagnostics=None):
     """Do the growid HTTPS login -> session dict {token, ...}. `blob_factory()` returns a fresh pre-auth
     dashboard blob (fresh meta) each call. Chain: POST dashboard(blob) -> GET growid/login (for _token) ->
     POST validate. The dashboard is flaky / meta is short-lived, so retry until it yields the page+_token."""
@@ -314,29 +445,42 @@ def growid_login(growid, password, blob_factory, timeout=15, attempts=4):
     for i in range(attempts):
         if i:
             time.sleep(2.0 + i)                                # polite backoff; the WAF 403s on rapid repeats
-        html, csrf = _login_page(op, timeout, blob_factory())
+        html, csrf = _login_page(op, timeout, blob_factory(), diagnostics=diagnostics)
         if csrf:
             break
         last = html
     if not csrf:
-        raise RuntimeError("dashboard never yielded the growid page/_token in %d tries; last response: %s"
-                           % (attempts, _snippet(last)))
+        if diagnostics is not None:
+            diagnostics.append({"stage": "csrf", "failure_kind": "csrf_not_found", "attempts": attempts})
+        raise RuntimeError("dashboard never yielded the growid page/_token in %d tries" % attempts)
     data = urllib.parse.urlencode({"_token": csrf, "growId": growid, "password": password}).encode()
     req = urllib.request.Request(LOGIN_HOST + "/player/growid/login/validate", data=data, method="POST",
                                  headers={"User-Agent": BROWSER_UA,
                                           "Content-Type": "application/x-www-form-urlencoded",
                                           "Origin": LOGIN_HOST, "Referer": LOGIN_HOST + "/player/growid/login"})
-    try:
-        with op.open(req, timeout=timeout) as r:
-            raw = r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
+    raw, status = _request(op, req, timeout, "validate", diagnostics)
     try:
         j = json.loads(raw)
     except ValueError:
-        raise RuntimeError("growid validate did not return JSON (CSRF/UA issue?): %s" % raw[:160])
+        rejection = _html_login_rejection(raw)
+        if diagnostics is not None:
+            event = {"stage": "validate_parse", "failure_kind": "html_login_rejected" if rejection else "non_json_response"}
+            if rejection:
+                event["reason_category"] = rejection
+            diagnostics.append(event)
+        if rejection:
+            raise RuntimeError("growid login rejected: %s (HTTP %d)" % (rejection, status)) from None
+        raise RuntimeError("growid validate did not return JSON (HTTP %d)" % status)
+    if not isinstance(j, dict):
+        if diagnostics is not None:
+            diagnostics.append({"stage": "validate_parse", "failure_kind": "unexpected_json_type"})
+        raise RuntimeError("growid validate returned an unexpected JSON type")
     if str(j.get("status")) != "success":
-        raise RuntimeError("growid login failed: %s" % j.get("message", raw[:160]))
+        reason = _login_rejection_kind(j.get("message", ""))
+        if diagnostics is not None:
+            diagnostics.append({"stage": "validate_result", "failure_kind": "login_rejected",
+                                "http_status": status, "reason_category": reason})
+        raise RuntimeError("growid login rejected: %s (HTTP %d)" % (reason, status))
     session = {"token": j.get("token", ""), "accountType": j.get("accountType"), "accountAge": j.get("accountAge")}
     # Surface the response SHAPE (keys only, no secret values) to learn how the token maps to the ENet
     # login fields. The real login uses user=<numeric> + token=<short> + UUIDToken, not the raw web token.
@@ -385,13 +529,24 @@ def authenticate(cfg):
     {meta, token, user?, ...}. Reads growid/password from cfg; never logs the password."""
     from login import PROTOCOL, GAME_VERSION
     sd_holder = {}
+    diagnostics = cfg.get("_auth_diagnostics")
 
     def blob_factory():                                        # fresh server_data (fresh meta) each attempt
-        sd = fetch_server_data(PROTOCOL, GAME_VERSION)
+        sd = fetch_server_data(PROTOCOL, GAME_VERSION, diagnostics=diagnostics)
         sd_holder["sd"] = sd
-        return _dashboard_blob(cfg, sd.get("meta", ""))
+        try:
+            return _dashboard_blob(cfg, sd.get("meta", ""))
+        except Exception as exc:
+            if diagnostics is not None:
+                diagnostics.append({"stage": "build_login_blob", "error_type": type(exc).__name__})
+            raise
 
-    session, _ = growid_login(cfg["growid"], cfg["password"], blob_factory)
+    try:
+        session, _ = growid_login(cfg["growid"], cfg["password"], blob_factory, diagnostics=diagnostics)
+    except Exception as exc:
+        if diagnostics is not None:
+            diagnostics.append({"stage": "authenticate", "error_type": type(exc).__name__})
+        raise
     sd = sd_holder["sd"]
     session["meta"] = sd.get("meta", "")
     session["_server_data"] = sd                                # server/port/etc. for the ENet connect
